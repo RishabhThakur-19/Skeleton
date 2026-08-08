@@ -1,4 +1,4 @@
-# Skeleton.py — Octopus Anatomical Skeleton Graph Extractor
+# Skeleton.py  — Octopus Anatomical Skeleton Graph Extractor
 
 Build a clean, smooth, anatomical skeleton graph from a single binary silhouette image of an octopus.
 
