@@ -5,7 +5,7 @@ Usage
     python skeletonize.py input.png output/
 
 Dependencies: Python 3.9+, numpy, OpenCV, scipy, networkx, matplotlib.
-No scikit-image dependency is required.
+
 """
 from __future__ import annotations
 
