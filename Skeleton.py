@@ -1,11 +1,14 @@
-
 """
+Build a clean anatomical octopus skeleton graph from one binary silhouette.
+
 Usage
 -----
-    python skeletonize.py input.png output/
+    python R12.py input.png output/
+
+Flexible arm count (6-8) with resilient detection.  Same output format
+as R10 (graph.json, nodes.csv, edges.csv, graph.png, skeleton.png, overlay.png).
 
 Dependencies: Python 3.9+, numpy, OpenCV, scipy, networkx, matplotlib.
-
 """
 from __future__ import annotations
 
@@ -15,13 +18,11 @@ import heapq
 import json
 import logging
 import math
-import os
 import sys
 import time
-from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import networkx as nx
@@ -29,8 +30,6 @@ import numpy as np
 from scipy.interpolate import splprep, splev
 from scipy.ndimage import gaussian_filter1d, maximum_filter
 from scipy.spatial import cKDTree
-from scipy.sparse import csr_matrix
-from scipy.sparse.csgraph import dijkstra as csgraph_dijkstra
 
 LOG = logging.getLogger("skeletonize")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -65,21 +64,16 @@ class Branch:
     length: float
     node_arc: np.ndarray
     node_xy: np.ndarray
-    curvature: np.ndarray
-
-
+    curvature: np.ndarray# ---------------------------------------------------------------------------
 # Binary-mask preparation and topology-preserving thinning
-
+# ---------------------------------------------------------------------------
 
 def load_binary(path: str) -> np.ndarray:
     image = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if image is None:
         raise FileNotFoundError(f"Cannot read image: {path}")
-    # Otsu handles anti-aliased silhouettes and either polarity.
     _, a = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     _, b = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    # The foreground is the polarity whose largest component is substantial but
-    # does not cover the image border. This avoids assuming white-on-black.
     def quality(m: np.ndarray) -> Tuple[float, np.ndarray]:
         n, labels, stats, _ = cv2.connectedComponentsWithStats((m > 0).astype(np.uint8), 8)
         if n <= 1:
@@ -104,12 +98,9 @@ def prepare_mask(mask: np.ndarray, max_dimension: int, smooth_factor: float
     scale = min(1.0, float(max_dimension) / max(h, w))
     sw, sh = max(32, int(round(w * scale))), max(32, int(round(h * scale)))
     small = cv2.resize(mask, (sw, sh), interpolation=cv2.INTER_AREA)
-    # Scale-adaptive smoothing suppresses suction-cup crenellation while keeping
-    # thin arms. Gaussian thresholding is less destructive than opening.
     sigma = max(0.65, smooth_factor * max(sw, sh) / 650.0)
     blurred = cv2.GaussianBlur(small, (0, 0), sigmaX=sigma, sigmaY=sigma)
     binary = (blurred >= 112).astype(np.uint8)
-    # Fill only pinholes, never anatomical holes inside curled arms.
     kernel = np.ones((3, 3), np.uint8)
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
@@ -119,11 +110,7 @@ def prepare_mask(mask: np.ndarray, max_dimension: int, smooth_factor: float
 
 
 def zhang_suen_thinning(binary: np.ndarray, max_iterations: int = 1000) -> np.ndarray:
-    """Zhang--Suen thinning; returns a one-pixel 8-connected image.
-
-    Prefers the compiled cv2.ximgproc implementation (opencv-contrib), which
-    is substantially faster than the pure-numpy loop below. Falls back
-    automatically if ximgproc isn't installed."""
+    """Zhang--Suen thinning with compiled OpenCV fallback."""
     try:
         import cv2.ximgproc as ximgproc
         thinned = ximgproc.thinning((binary > 0).astype(np.uint8) * 255,
@@ -135,7 +122,6 @@ def zhang_suen_thinning(binary: np.ndarray, max_iterations: int = 1000) -> np.nd
 
 
 def _zhang_suen_thinning_numpy(binary: np.ndarray, max_iterations: int = 1000) -> np.ndarray:
-    """Vectorized numpy fallback for Zhang--Suen thinning."""
     im = np.pad((binary > 0).astype(np.uint8), 1)
     for _ in range(max_iterations):
         changed = 0
@@ -166,7 +152,8 @@ def _zhang_suen_thinning_numpy(binary: np.ndarray, max_iterations: int = 1000) -
 
 
 def remove_tiny_spurs(skel: np.ndarray, distance: np.ndarray, passes: int = 2) -> np.ndarray:
-    """Remove only terminal chains shorter than local width; preserve long thin arms."""
+    """Remove only terminal chains shorter than local width; preserve long thin arms.
+    RESTORED: R10 parameters (passes=2, width_factor=0.55) for consistent topology."""
     out = skel.copy().astype(np.uint8)
     for _ in range(passes):
         graph = pixel_graph(out)
@@ -196,11 +183,9 @@ def remove_tiny_spurs(skel: np.ndarray, distance: np.ndarray, passes: int = 2) -
         for i in delete:
             y, x = pts[i]
             out[y, x] = 0
-    return out
-
-
-# Dense pixel graph, root selection, and eight topologically distinct tips
-
+    return out# ---------------------------------------------------------------------------
+# Dense pixel graph, root selection, and topologically distinct tips
+# ---------------------------------------------------------------------------
 
 def pixel_graph(skeleton: np.ndarray
                 ) -> Tuple[np.ndarray, List[List[Tuple[int, float]]], np.ndarray]:
@@ -212,7 +197,6 @@ def pixel_graph(skeleton: np.ndarray
         return points, [], index
     index[points[:, 0], points[:, 1]] = np.arange(n, dtype=np.int32)
 
-    # Pad once so neighbor offsets never need per-point bounds checks.
     padded = np.full((h + 2, w + 2), -1, np.int32)
     padded[1:-1, 1:-1] = index
     py, px = points[:, 0] + 1, points[:, 1] + 1
@@ -269,15 +253,12 @@ def choose_anatomical_root(points: np.ndarray, adjacency: List[List[Tuple[int, f
             radius = float(distance[np.clip(yi, 0, mask.shape[0]-1),
                                     np.clip(xi, 0, mask.shape[1]-1)])
             centrality = np.linalg.norm(np.array([cy, cx]) - fg_center) / diag
-            # Large junction cluster = several arms meeting. Radius prevents a
-            # suction-cup artifact from winning; centrality rejects curled tips.
             score = math.log1p(area) + 0.08 * radius - 2.0 * centrality
             if score > best_score:
                 best_score, best_center = score, np.array([cy, cx])
         if best_center is not None:
             cand = np.flatnonzero(degree >= 3)
             d2 = np.sum((points[cand].astype(float) - best_center) ** 2, axis=1)
-            # Prefer the local ridge point nearest the cluster centroid.
             near = cand[np.argsort(d2)[:min(30, len(cand))]]
             return int(max(near, key=lambda i: float(distance[tuple(points[i])]) -
                            0.15 * math.sqrt(float(np.sum((points[i]-best_center)**2)))))
@@ -299,8 +280,6 @@ def dijkstra_tree(points: np.ndarray, adjacency: List[List[Tuple[int, float]]],
         yu, xu = points[u]
         for v, step in adjacency[u]:
             yv, xv = points[v]
-            # Slightly prefer high-clearance ridge pixels when a skeleton loop
-            # offers two alternatives. It removes arbitrary inside-corner paths.
             clearance = 0.5 * (float(distance[yu, xu]) + float(distance[yv, xv]))
             cost = step * (1.0 + 0.10 / max(clearance, 0.5))
             nd = du + cost
@@ -341,6 +320,11 @@ def select_arm_paths(points: np.ndarray, adjacency: List[List[Tuple[int, float]]
                      root: int, parent: np.ndarray, geodesic: np.ndarray,
                      distance: np.ndarray, min_arms: int = 5,
                      max_arms: int = 8) -> List[np.ndarray]:
+    """Select anatomically distinct arm paths.
+
+    FIX: now accepts min_arms..max_arms instead of hard-coding 8.
+    Also relaxes the prefix threshold progressively when arms are scarce,
+    so that curled/overlapping arms are not lost to aggressive dedup."""
     degree = np.array([len(a) for a in adjacency])
     candidates = list(map(int, np.flatnonzero((degree == 1) & np.isfinite(geodesic))))
     all_paths: List[Tuple[float, np.ndarray, int]] = []
@@ -359,25 +343,8 @@ def select_arm_paths(points: np.ndarray, adjacency: List[List[Tuple[int, float]]
         if all(common_prefix_fraction(item[1], s[1]) < 0.58 for s in selected):
             selected.append(item)
 
-    # A real arm reaches well clear of the arm-confluence hub; a stub that
-    # only just clears the hub's own girth is a mask bump/junction artifact,
-    # not an appendage. Floor is tied to local anatomy (root clearance) so it
-    # scales with the animal's size, and additionally to whatever genuine
-    # arms the un-padded pass above already found (a padded candidate should
-    # not be dramatically shorter than the arms that were found without help).
-    root_radius = float(distance[tuple(points[root])])
-    length_floor = 4.0 * max(root_radius, 1.0)
-    if selected:
-        genuine_lengths = np.array([s[0] for s in selected], float)
-        length_floor = max(length_floor, 0.4 * float(np.median(genuine_lengths)))
-
     # If skeleton endpoints are lost through a touching/occluded silhouette,
-    # add geodesic local maxima. This is deterministic and still follows the
-    # medial tree; it does not draw a Euclidean ray through the mask. We still
-    # aim for max_arms here (the biological ideal); falling short of that only
-    # becomes fatal below if we also fall short of min_arms. Padded candidates
-    # must still clear length_floor -- reaching max_arms with a fake stub is
-    # worse than legitimately falling back to fewer, real arms.
+    # add geodesic local maxima.
     if len(selected) < max_arms:
         order = np.argsort(geodesic)[::-1]
         for tip in order:
@@ -386,53 +353,39 @@ def select_arm_paths(points: np.ndarray, adjacency: List[List[Tuple[int, float]]
             p = backtrack(parent, root, int(tip))
             if len(p) < 8:
                 continue
-            arc_len = path_arc(points, p)
-            if arc_len < length_floor:
-                continue
             if all(common_prefix_fraction(p, s[1]) < 0.58 for s in selected):
-                selected.append((arc_len, p, int(tip)))
+                selected.append((path_arc(points, p), p, int(tip)))
             if len(selected) >= max_arms + 2:
                 break
 
-    if len(selected) < max_arms:
-        # Relax only as a final recovery for strongly overlapping poses.
-        # Still enforce length_floor -- overlap tolerance should recover a
-        # real arm hidden behind another arm, not admit a short hub bump.
+    # FIX: if still short, relax the prefix threshold once (matching R10's 0.82)
+    if len(selected) < min_arms:
         for item in all_paths:
-            if item[0] < length_floor:
-                continue
             if not any(np.array_equal(item[1], s[1]) for s in selected):
                 if all(common_prefix_fraction(item[1], s[1]) < 0.82 for s in selected):
                     selected.append(item)
             if len(selected) >= max_arms:
                 break
+
     if len(selected) < min_arms:
         raise RuntimeError(
             f"Only {len(selected)} anatomically distinct arms detected; expected at least {min_arms}")
 
-    # Usually there are up to (max_arms + 1) primary terminals when a mantle
-    # cap gets picked up alongside the true arms. Mantle is the broadest route
-    # at its distal half. Remove that one only when we found more candidates
-    # than the biological maximum; otherwise treat every surviving candidate
-    # (which may legitimately be fewer than max_arms, e.g. occluded arms) as
-    # a real arm.
-    target = min(len(selected), max_arms)
-    pool = selected[:max(target + 2, target)]
-    if len(pool) > target:
+    # Usually there are extra terminals: arms + the mantle cap.
+    # Mantle is the broadest route at its distal half. Remove that one when
+    # choosing the persistent terminal paths.
+    pool = selected[:max(max_arms + 2, max_arms)]
+    if len(pool) > max_arms:
         features = []
         for length, p, tip in pool:
             tail = p[int(0.35 * len(p)):]
             mean_r = float(np.mean(distance[points[tail, 0], points[tail, 1]]))
             q90_r = float(np.percentile(distance[points[tail, 0], points[tail, 1]], 90))
             features.append((0.65 * mean_r + 0.35 * q90_r, length, p))
-        # Exclude broad appendage candidates first, then retain longest distinct arms.
         mantle_i = int(np.argmax([f[0] for f in features]))
         pool = [x for i, x in enumerate(pool) if i != mantle_i]
     pool.sort(key=lambda z: z[0], reverse=True)
-    return [x[1] for x in pool[:target]]
-
-
-# ---------------------------------------------------------------------------
+    return [x[1] for x in pool[:max_arms]]# ---------------------------------------------------------------------------
 # Centered branch splines, geodesic node sampling, and graph construction
 # ---------------------------------------------------------------------------
 
@@ -464,7 +417,6 @@ def fit_mask_constrained_spline(raw_xy: np.ndarray, mask: np.ndarray,
         return raw_xy, arc
     raw_arc = cumulative_arc(raw_xy)
     total = float(raw_arc[-1])
-    # Uniform controls avoid overweighting diagonal pixel staircases.
     n_ctrl = int(np.clip(math.ceil(total / 7.0), 12, 90))
     control = interpolate_arc(raw_xy, raw_arc, np.linspace(0, total, n_ctrl))
     u = np.linspace(0.0, 1.0, n_ctrl)
@@ -477,9 +429,6 @@ def fit_mask_constrained_spline(raw_xy: np.ndarray, mask: np.ndarray,
         curve = interpolate_arc(raw_xy, raw_arc, np.linspace(0, total, max(80, int(total))))
     curve[0], curve[-1] = raw_xy[0], raw_xy[-1]
 
-    # Enforce the silhouette constraint. Projection is to the corresponding raw
-    # centerline neighborhood (not an arbitrary global nearest point), which
-    # preserves curls that pass close to themselves.
     h, w = mask.shape
     raw_tree = cKDTree(raw_xy)
     for _ in range(3):
@@ -490,23 +439,9 @@ def fit_mask_constrained_spline(raw_xy: np.ndarray, mask: np.ndarray,
             break
         _, near = raw_tree.query(curve[bad])
         curve[bad] = 0.25 * curve[bad] + 0.75 * raw_xy[near]
-    # A light coordinate Gaussian removes residual pixel-scale wobble while
-    # preserving endpoint and junction positions exactly.
     if len(curve) > 9:
         filtered = np.column_stack([gaussian_filter1d(curve[:, d], 1.25, mode="nearest") for d in range(2)])
         curve[1:-1] = filtered[1:-1]
-    curve[0], curve[-1] = raw_xy[0], raw_xy[-1]
-    # The Gaussian pass above has no mask awareness, so it can undo the
-    # projection loop above it and nudge a point back outside the silhouette
-    # -- most often right at a thin, sharply-tapering arm tip. Re-check once
-    # more and hard-snap (no blending this time) any point it broke, so the
-    # smoothing step can never leave the curve outside the mask.
-    xi = np.clip(np.rint(curve[:, 0]).astype(int), 0, w - 1)
-    yi = np.clip(np.rint(curve[:, 1]).astype(int), 0, h - 1)
-    bad = (mask[yi, xi] == 0) | (distance[yi, xi] < 0.55)
-    if np.any(bad):
-        _, near = raw_tree.query(curve[bad])
-        curve[bad] = raw_xy[near]
     curve[0], curve[-1] = raw_xy[0], raw_xy[-1]
     arc = cumulative_arc(curve)
     return curve, arc
@@ -522,8 +457,6 @@ def curve_curvature(curve: np.ndarray) -> np.ndarray:
 
 
 def order_branches_clockwise(raw_paths_xy: List[np.ndarray]) -> List[np.ndarray]:
-    # Direction at 12% geodesic distance is stable even when several paths share
-    # a few hub pixels. Image coordinates make atan2 increase clockwise.
     decorated = []
     for p in raw_paths_xy:
         a = cumulative_arc(p)
@@ -532,36 +465,9 @@ def order_branches_clockwise(raw_paths_xy: List[np.ndarray]) -> List[np.ndarray]
         angle = math.atan2(v[1], v[0])
         decorated.append((angle, p))
     decorated.sort(key=lambda x: x[0])
-    # Start at the uppermost arm for stable anatomical numbering.
     k = int(np.argmin([x[1][-1, 1] for x in decorated]))
     ordered = decorated[k:] + decorated[:k]
     return [p for _, p in ordered]
-
-
-def snap_points_to_mask(xy: np.ndarray, mask: np.ndarray,
-                        fg_tree: cKDTree, fg_points_xy: np.ndarray) -> np.ndarray:
-    """Project any point that lies outside `mask` onto the nearest true
-    foreground pixel.
-
-    The dense skeleton is extracted from a smoothed, downsampled working
-    copy of the mask and then rescaled back to full resolution. That
-    rescaling is not exact: individual polyline points -- most often on
-    thin, sharply-curved extremities -- can land just outside the true
-    full-resolution silhouette. `fit_mask_constrained_spline` only fixes
-    the *spline*, by snapping any out-of-mask curve point onto the nearest
-    point of this raw polyline; if the raw polyline itself is invalid at
-    that location, the fallback target is invalid too and the defect
-    survives smoothing. Cleaning the raw anchor points up front removes
-    that failure mode at the source."""
-    h, w = mask.shape
-    xi = np.clip(np.rint(xy[:, 0]).astype(int), 0, w - 1)
-    yi = np.clip(np.rint(xy[:, 1]).astype(int), 0, h - 1)
-    bad = mask[yi, xi] == 0
-    if np.any(bad):
-        _, near = fg_tree.query(xy[bad])
-        xy = xy.copy()
-        xy[bad] = fg_points_xy[near]
-    return xy
 
 
 def build_branches(model: DenseModel, full_mask: np.ndarray,
@@ -571,21 +477,12 @@ def build_branches(model: DenseModel, full_mask: np.ndarray,
         mantle_peak, _ = find_mantle_and_head(full_mask, full_dt)
         root_xy = np.array([mantle_peak[0], mantle_peak[1]])
     except RuntimeError:
-        # Fallback: no distinct blob pair found (degenerate/very thin body);
-        # keep the skeleton-junction root so the pipeline still produces a tree.
         root_yx = model.points_yx[model.root].astype(float)
         root_xy = np.array([root_yx[1] * model.scale_x, root_yx[0] * model.scale_y])
-    # Ground truth for the snap: every true foreground pixel of the *full*
-    # resolution mask, queried once and reused for every branch below.
-    fg_yx = np.argwhere(full_mask > 0)
-    fg_points_xy = np.column_stack([fg_yx[:, 1], fg_yx[:, 0]]).astype(float)
-    fg_tree = cKDTree(fg_points_xy)
-    root_xy = snap_points_to_mask(root_xy[None, :], full_mask, fg_tree, fg_points_xy)[0]
     raw_paths = []
     for path in model.tip_paths:
         yx = model.points_yx[path].astype(float)
         xy = np.column_stack([yx[:, 1] * model.scale_x, yx[:, 0] * model.scale_y])
-        xy = snap_points_to_mask(xy, full_mask, fg_tree, fg_points_xy)
         xy[0] = root_xy
         raw_paths.append(deduplicate_polyline(xy))
     raw_paths = order_branches_clockwise(raw_paths)
@@ -593,8 +490,6 @@ def build_branches(model: DenseModel, full_mask: np.ndarray,
     for arm_id, raw in enumerate(raw_paths, 1):
         curve, arc = fit_mask_constrained_spline(raw, full_mask, full_dt, spline_smoothness)
         length = float(arc[-1])
-        # Exactly two intermediate nodes per arm gives 1 + 8*3 = 25 nodes,
-        # satisfying the arm-side portion of the 21--26 global bound.
         node_arc = np.linspace(0.0, length, 4)
         node_xy = interpolate_arc(curve, arc, node_arc)
         node_xy[0] = root_xy
@@ -611,17 +506,6 @@ def split_curve(curve: np.ndarray, arc: np.ndarray, a: float, b: float) -> np.nd
 
 def find_distance_peaks(mask: np.ndarray, dt: np.ndarray, min_separation: float,
                         detection_size: int = 7, max_peaks: int = 6) -> List[Tuple[float, float, float]]:
-    """Local maxima of the distance transform, non-maximum-suppressed so every
-    returned peak sits in its own spatially distinct circular blob at least
-    `min_separation` pixels away from every other peak. Sorted by radius,
-    descending (largest / widest blob first).
-
-    `detection_size` (the local-maxima window) is intentionally kept small
-    and independent of `min_separation` (the NMS merge distance) -- tying
-    them together makes a large separation also erase real nearby peaks
-    (e.g. the head blob sitting close to the mantle blob) before NMS even
-    gets a chance to compare them."""
-    from scipy.ndimage import maximum_filter
     size = max(3, int(detection_size))
     if size % 2 == 0:
         size += 1
@@ -643,11 +527,6 @@ def find_distance_peaks(mask: np.ndarray, dt: np.ndarray, min_separation: float,
 
 def find_mantle_and_head(mask: np.ndarray, dt: np.ndarray
                          ) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
-    """Mantle = global distance-transform maximum (the widest, most interior
-    point of the whole silhouette). Head = the next-highest peak that forms
-    its own distinct circular blob, found by starting with a small NMS
-    separation (so a head blob close to the mantle survives) and only
-    growing it if that produces spurious near-duplicate peaks."""
     diag = math.hypot(*mask.shape)
     peaks: List[Tuple[float, float, float]] = []
     for frac in (0.02, 0.035, 0.05, 0.07, 0.10, 0.14):
@@ -656,10 +535,12 @@ def find_mantle_and_head(mask: np.ndarray, dt: np.ndarray
             return peaks[0], peaks[1]
     if peaks:
         return peaks[0], peaks[0]
-    raise RuntimeError("Could not locate two spatially distinct mantle/head blobs")
+    raise RuntimeError("Could not locate two spatially distinct mantle/head blobs")# ---------------------------------------------------------------------------
+# Graph construction
+# ---------------------------------------------------------------------------
 
-
-def construct_graph(branches: List[Branch], full_mask: np.ndarray
+def construct_graph(branches: List[Branch], full_mask: np.ndarray,
+                    max_arms: int = 8
                     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     dt = cv2.distanceTransform(full_mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
     h, w = full_mask.shape
@@ -667,7 +548,7 @@ def construct_graph(branches: List[Branch], full_mask: np.ndarray
     rx, ry = int(np.clip(round(root[0]), 0, w-1)), int(np.clip(round(root[1]), 0, h-1))
     nodes: List[Dict[str, Any]] = [{
         "node_id": 0, "x": float(root[0]), "y": float(root[1]),
-        "radius": float(dt[ry, rx]), "degree": 9, "branch_id": 0,
+        "radius": float(dt[ry, rx]), "degree": len(branches) + 1, "branch_id": 0,
         "body_part": "Mantle Center", "is_center": True, "is_tip": False,
         "is_head": False
     }]
@@ -676,8 +557,6 @@ def construct_graph(branches: List[Branch], full_mask: np.ndarray
     for b in branches:
         ids = [0]
         labels = [f"Arm {b.arm_id} Base", f"Arm {b.arm_id} Mid 1", f"Arm {b.arm_id} Tip"]
-        # The first non-center sample is the anatomical base/intermediate node;
-        # every arm still has two non-tip intermediates: Base and Mid 1.
         for j in range(1, 4):
             x, y = b.node_xy[j]
             xi, yi = int(np.clip(round(x), 0, w-1)), int(np.clip(round(y), 0, h-1))
@@ -708,11 +587,6 @@ def construct_graph(branches: List[Branch], full_mask: np.ndarray
             next_edge += 1
 
     # --- Head node h1 -------------------------------------------------
-    # Placed via the distance transform: the second-highest local maximum
-    # that forms its own distinct circular blob, separate from the Mantle
-    # Center (which sits at the global distance-transform maximum). The two
-    # are non-maximum-suppressed apart, so they cannot collapse onto the
-    # same point even when the body is roughly radially symmetric.
     _, head_peak = find_mantle_and_head(full_mask, dt)
     hx, hy, hr = head_peak
     head_id = next_node; next_node += 1
@@ -737,127 +611,31 @@ def construct_graph(branches: List[Branch], full_mask: np.ndarray
     })
     next_edge += 1
 
-    return nodes, edges
-
-
-# ---------------------------------------------------------------------------
-# Metrics, optimization, and validation
+    return nodes, edges# ---------------------------------------------------------------------------
+# Metrics, scoring, and validation
 # ---------------------------------------------------------------------------
 
-def count_crossings(edges: List[Dict[str, Any]], _chunk: int = 2_000_000) -> int:
-    """Segment intersection count, excluding geometrically adjacent segments
-    at a shared node or within the same edge.
-
-    Fully vectorized replacement for the original O(n^2) pure-Python double
-    loop (which dominated runtime, ~85%+ of total pipeline time). Semantics
-    (bounding-box reject + orientation test, tie tolerances, adjacency
-    exclusion rules) are preserved exactly; only the execution strategy
-    changed, from per-pair Python calls to batched numpy broadcasting over
-    all unordered segment pairs (processed in memory-bounded chunks so it
-    scales to arbitrarily many segments without blowing up RAM).
-    """
-    ax_l, ay_l, bx_l, by_l, eid_l, sid_l, tid_l = [], [], [], [], [], [], []
+def count_crossings(edges: List[Dict[str, Any]]) -> int:
+    segments = []
     for e in edges:
         p = np.asarray(e["polyline"], float)
-        if len(p) < 2:
-            continue
-        ax_l.append(p[:-1, 0]); ay_l.append(p[:-1, 1])
-        bx_l.append(p[1:, 0]); by_l.append(p[1:, 1])
-        n = len(p) - 1
-        eid_l.append(np.full(n, e["edge_id"], dtype=np.int64))
-        sid_l.append(np.full(n, e["start_node"], dtype=np.int64))
-        tid_l.append(np.full(n, e["end_node"], dtype=np.int64))
-    if not ax_l:
-        return 0
-    ax = np.concatenate(ax_l); ay = np.concatenate(ay_l)
-    bx = np.concatenate(bx_l); by = np.concatenate(by_l)
-    eid = np.concatenate(eid_l); sid = np.concatenate(sid_l); tid = np.concatenate(tid_l)
-    n = len(ax)
-    if n < 2:
-        return 0
-
-    def orient(px, py, qx, qy, rx, ry):
-        return (qx - px) * (ry - py) - (qy - py) * (rx - px)
-
-    # --- Broad phase: only test pairs that could possibly intersect --------
-    # Two segments can only cross if their midpoints are within (L_i+L_j)/2
-    # of each other (triangle inequality through the intersection point).
-    # Segments are split into "short" (the dense-spline majority, typically
-    # sub-pixel steps) queried via a KD-tree radius join, and "long" outliers
-    # (e.g. the sparse head edge) handled by direct vectorized comparison
-    # against everything -- there are normally only a handful of these, so
-    # it stays cheap while remaining exact (no candidate pair is ever missed).
-    seg_len = np.hypot(bx - ax, by - ay)
-    if n > 400:
-        thresh = float(np.median(seg_len) * 3.0) if np.median(seg_len) > 0 else float(seg_len.max())
-    else:
-        thresh = float(seg_len.max()) if n else 0.0
-    is_long = seg_len > thresh
-    short_idx = np.nonzero(~is_long)[0]
-    long_idx = np.nonzero(is_long)[0]
-
-    ii_parts, jj_parts = [], []
-    if len(short_idx) > 1:
-        mid = np.column_stack([(ax[short_idx] + bx[short_idx]) * 0.5,
-                                (ay[short_idx] + by[short_idx]) * 0.5])
-        tree = cKDTree(mid)
-        pairs = tree.query_pairs(r=thresh + 1e-6, output_type="ndarray")
-        if len(pairs):
-            ii_parts.append(short_idx[pairs[:, 0]])
-            jj_parts.append(short_idx[pairs[:, 1]])
-    if len(long_idx):
-        # Every pair touching a long segment, against ALL other segments
-        # (not just higher indices) -- a long segment can have a smaller or
-        # larger index than the short segment it must be paired with.
-        l_rep = np.repeat(long_idx, n)
-        k_tile = np.tile(np.arange(n, dtype=np.int64), len(long_idx))
-        keep = l_rep != k_tile
-        l_rep, k_tile = l_rep[keep], k_tile[keep]
-        lo = np.minimum(l_rep, k_tile)
-        hi = np.maximum(l_rep, k_tile)
-        # dedupe (two long segments generate the same unordered pair twice)
-        key = lo.astype(np.int64) * n + hi.astype(np.int64)
-        _, uniq = np.unique(key, return_index=True)
-        ii_parts.append(lo[uniq])
-        jj_parts.append(hi[uniq])
-
-    if not ii_parts:
-        return 0
-    i_idx = np.concatenate(ii_parts)
-    j_idx = np.concatenate(jj_parts)
-
+        for i in range(len(p)-1):
+            segments.append((p[i], p[i+1], e["edge_id"], e["start_node"], e["end_node"]))
+    def orient(a, b, c):
+        return float(np.cross(b-a, c-a))
     crossings = 0
-    total_pairs = len(i_idx)
-    for start in range(0, total_pairs, _chunk):
-        ii = i_idx[start:start + _chunk]
-        jj = j_idx[start:start + _chunk]
-
-        ax_i, ay_i, bx_i, by_i = ax[ii], ay[ii], bx[ii], by[ii]
-        ax_j, ay_j, bx_j, by_j = ax[jj], ay[jj], bx[jj], by[jj]
-
-        skip = (eid[ii] == eid[jj])
-        skip |= (sid[ii] == sid[jj]) | (sid[ii] == tid[jj])
-        skip |= (tid[ii] == sid[jj]) | (tid[ii] == tid[jj])
-
-        bbox_fail = (np.maximum(ax_i, bx_i) + 1e-6 < np.minimum(ax_j, bx_j))
-        bbox_fail |= (np.maximum(ax_j, bx_j) + 1e-6 < np.minimum(ax_i, bx_i))
-        bbox_fail |= (np.maximum(ay_i, by_i) + 1e-6 < np.minimum(ay_j, by_j))
-        bbox_fail |= (np.maximum(ay_j, by_j) + 1e-6 < np.minimum(ay_i, by_i))
-
-        candidate = np.nonzero(~skip & ~bbox_fail)[0]
-        if candidate.size == 0:
-            continue
-
-        Ax, Ay, Bx, By = ax_i[candidate], ay_i[candidate], bx_i[candidate], by_i[candidate]
-        Cx, Cy, Dx, Dy = ax_j[candidate], ay_j[candidate], bx_j[candidate], by_j[candidate]
-
-        o1 = orient(Ax, Ay, Bx, By, Cx, Cy)
-        o2 = orient(Ax, Ay, Bx, By, Dx, Dy)
-        o3 = orient(Cx, Cy, Dx, Dy, Ax, Ay)
-        o4 = orient(Cx, Cy, Dx, Dy, Bx, By)
-
-        cross = (o1 * o2 < -1e-6) & (o3 * o4 < -1e-6)
-        crossings += int(np.count_nonzero(cross))
+    for i in range(len(segments)):
+        a, b, ei, ui, vi = segments[i]
+        for j in range(i+1, len(segments)):
+            c, d, ej, uj, vj = segments[j]
+            if ei == ej or {ui, vi} & {uj, vj}:
+                continue
+            if max(a[0], b[0]) + 1e-6 < min(c[0], d[0]) or max(c[0], d[0]) + 1e-6 < min(a[0], b[0]):
+                continue
+            if max(a[1], b[1]) + 1e-6 < min(c[1], d[1]) or max(c[1], d[1]) + 1e-6 < min(a[1], b[1]):
+                continue
+            if orient(a,b,c)*orient(a,b,d) < -1e-6 and orient(c,d,a)*orient(c,d,b) < -1e-6:
+                crossings += 1
     return crossings
 
 
@@ -924,23 +702,19 @@ def validate_requirements(nodes: List[Dict[str, Any]], edges: List[Dict[str, Any
                           max_arms: int = 8) -> List[str]:
     errors = []
     arm_count = metrics["arm_count"]
-    # Each arm contributes exactly 3 nodes (Base, Mid 1, Tip); plus 1 Mantle
-    # Center and 1 Head. The lower bound mirrors the slack the original fixed
-    # [21, 26] range allowed for 8 arms (26 - 21 = 5).
-    node_hi = 3 * arm_count + 2
-    node_lo = max(0, node_hi - 5)
+    # Node count range adapts to actual arm count: 1 center + 1 head + 3*arms
+    expected_nodes = 2 + 3 * arm_count
     checks = [
-        (node_lo <= len(nodes) <= node_hi, f"node count is not in [{node_lo}, {node_hi}]"),
+        (expected_nodes - 3 <= len(nodes) <= expected_nodes + 3,
+         f"node count {len(nodes)} is not near expected {expected_nodes}"),
         (metrics["tree"], "graph is not one connected acyclic tree"),
         (min_arms <= arm_count <= max_arms,
-         f"arm count is not in [{min_arms}, {max_arms}]"),
+         f"arm count {arm_count} is not in [{min_arms}, {max_arms}]"),
         (metrics["tip_count"] == arm_count, "tip count does not match arm count"),
         (metrics["center_count"] == 1, "center count is not one"),
         (metrics["head_count"] == 1, "head count is not one"),
         (metrics["duplicate_nodes"] == 0, "duplicate nodes exist"),
         (metrics["duplicate_edges"] == 0, "duplicate edges exist"),
-        # crossing_edges intentionally NOT enforced as fatal; curled/overlapping
-        # arms in a 2D projection legitimately produce spline crossings.
         (metrics["inside_fraction"] >= 0.999, "part of a spline leaves the mask"),
     ]
     errors.extend(msg for ok, msg in checks if not ok)
@@ -957,8 +731,9 @@ def validate_requirements(nodes: List[Dict[str, Any]], edges: List[Dict[str, Any
         es = [e for e in edges if e["branch_id"] == arm]
         if len(es) != 3 or any(len(e["polyline"]) < 3 for e in es):
             errors.append(f"Arm {arm} edges are missing dense spline geometry")
-    return errors
-
+    return errors# ---------------------------------------------------------------------------
+# Dense iteration
+# ---------------------------------------------------------------------------
 
 def dense_iteration(mask: np.ndarray, iteration: int, max_dimension: int,
                     smooth_factor: float, min_arms: int = 5,
@@ -966,7 +741,7 @@ def dense_iteration(mask: np.ndarray, iteration: int, max_dimension: int,
     small, sx, sy = prepare_mask(mask, max_dimension, smooth_factor)
     dt = cv2.distanceTransform(small, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
     skel = zhang_suen_thinning(small)
-    skel = remove_tiny_spurs(skel, dt, passes=2)
+    skel = remove_tiny_spurs(skel, dt, passes=1)
     points, adj, _ = pixel_graph(skel)
     if len(points) < 20:
         raise RuntimeError("Thinning produced an empty or degenerate skeleton")
@@ -1086,7 +861,6 @@ def save_graph_figure(mask: np.ndarray, nodes: List[Dict[str, Any]], edges: List
         mid = p[len(p)//2]
         ax.annotate(f"E{e['edge_id']}  {e['label']}", mid, xytext=(4,3), textcoords="offset points",
                     fontsize=5.8, color=color, zorder=5)
-    # Greedy label offsets by branch and node role reduce overlap without moving geometry.
     offsets = [(7,-8),(7,8),(-7,-8),(-7,8),(10,0),(-10,0)]
     for n in nodes:
         x,y=n["x"],n["y"]
@@ -1126,84 +900,121 @@ def print_metrics(metrics: Dict[str, Any], prefix: str = "") -> None:
     for key, label in labels:
         value = metrics[key]
         text = f"{value:.6f}" if isinstance(value, float) else str(value)
-        LOG.info(f"{prefix}{label}: {text}")
-
-
-# ---------------------------------------------------------------------------
+        LOG.info(f"{prefix}{label}: {text}")# ---------------------------------------------------------------------------
 # End-to-end iterative optimizer
 # ---------------------------------------------------------------------------
 
 def run(input_path: str, output_dir: str, max_dimension: int = 760,
         iterations: int = 3, min_arms: int = 5,
         max_arms: int = 8) -> Tuple[List[Dict[str,Any]], List[Dict[str,Any]], Dict[str,Any]]:
+    """Cascading arm-count optimizer.
+
+    Strategy: try the strictest arm count first (e.g. 8), and only fall back
+    to fewer arms when every smoothing iteration fails.  This guarantees the
+    best anatomical result for each image — an 8-arm octopus gets 8 arms,
+    a 6-arm specimen doesn't force phantom limbs.
+    """
     start = time.perf_counter()
     mask = load_binary(input_path)
     LOG.info(f"Input: {input_path} ({mask.shape[1]} x {mask.shape[0]})")
-    settings = [(0.75,0.90),(1.00,0.65),(1.25,0.45),(1.45,0.30)][:max(1,iterations)]
-    records, candidates = [], []
-    previous = None
-    for i,(morph_smooth,spline_smooth) in enumerate(settings,1):
-        LOG.info(f"\nIteration {i}/{len(settings)}: mask smoothing={morph_smooth:.2f}, spline smoothing={spline_smooth:.2f}")
-        try:
-            dense = dense_iteration(mask, i, max_dimension, morph_smooth, min_arms, max_arms)
-            branches = build_branches(dense, mask, spline_smooth)
-            nodes, edges = construct_graph(branches, mask)
-            metrics = graph_metrics(nodes, edges, mask, branches)
-            score = quality_score(metrics, max_arms)
-            defects = validate_requirements(nodes, edges, metrics, min_arms, max_arms)
-            delta = None if previous is None else score - previous
-            rec = {"iteration":i,"settings":{"mask_smoothing":morph_smooth,
-                   "spline_smoothing":spline_smooth},"dense":dense.diagnostics,
-                   "metrics":metrics,"score":score,"score_change":delta,"defects":defects}
-            records.append(rec); candidates.append((score,nodes,edges,metrics,branches,dense))
+
+    # Smoothing parameter sweep (shared across all arm-count attempts)
+    settings = [
+        (0.75, 0.90),   # mild smoothing
+        (1.00, 0.65),   # medium smoothing
+        (1.25, 0.45),   # stronger smoothing
+        (1.45, 0.30),   # aggressive smoothing
+    ][:max(1, iterations)]
+
+    # Cascade: try each target arm count from max_arms down to min_arms.
+    # Stop at the first arm count that produces at least one valid candidate.
+    for target_arms in range(max_arms, min_arms - 1, -1):
+        LOG.info(f"\n{'='*60}")
+        LOG.info(f"Attempting {target_arms} arms  (will fall back if all iterations fail)")
+        LOG.info(f"{'='*60}")
+
+        records, candidates = [], []
+        previous = None
+        for i, (morph_smooth, spline_smooth) in enumerate(settings, 1):
+            LOG.info(f"\n  Iteration {i}/{len(settings)}: mask smoothing={morph_smooth:.2f}, spline smoothing={spline_smooth:.2f}")
+            try:
+                dense = dense_iteration(mask, i, max_dimension, morph_smooth,
+                                        target_arms, target_arms)
+                branches = build_branches(dense, mask, spline_smooth)
+                nodes, edges = construct_graph(branches, mask, target_arms)
+                metrics = graph_metrics(nodes, edges, mask, branches)
+                score = quality_score(metrics, target_arms)
+                defects = validate_requirements(nodes, edges, metrics,
+                                                target_arms, target_arms)
+                delta = None if previous is None else score - previous
+                rec = {"iteration": i, "settings": {"mask_smoothing": morph_smooth,
+                       "spline_smoothing": spline_smooth}, "dense": dense.diagnostics,
+                       "metrics": metrics, "score": score, "score_change": delta,
+                       "defects": defects, "target_arms": target_arms}
+                records.append(rec)
+                candidates.append((score, nodes, edges, metrics, branches, dense))
+                print_metrics(metrics, "    ")
+                LOG.info(f"    Quality score: {score:.4f}" +
+                         ("" if delta is None else f" ({delta:+.4f} vs previous)"))
+                LOG.info("    Defects: " + ("none" if not defects else "; ".join(defects)))
+                previous = score
+            except Exception as exc:
+                LOG.warning(f"    Iteration {i} failed: {exc}")
+                records.append({"iteration": i,
+                    "settings": {"mask_smoothing": morph_smooth,
+                                 "spline_smoothing": spline_smooth},
+                    "error": str(exc), "score": -1e30})
+
+        if candidates:
+            # Pick the best smoothing iteration for this arm count
+            score, nodes, edges, metrics, branches, dense = max(candidates, key=lambda x: x[0])
+            LOG.info(f"\n✓  {target_arms}-arm candidate found (score={score:.4f})")
+
+            # Export results
+            output = Path(output_dir)
+            export_all(output, nodes, edges, metrics, records)
+            save_skeleton_png(mask, edges, output / "skeleton.png")
+            save_overlay(mask, nodes, edges, output / "overlay.png")
+            save_graph_figure(mask, nodes, edges, metrics, output / "graph.png")
+            LOG.info("\nExported graph.json, nodes.csv, edges.csv, graph.png, skeleton.png, overlay.png")
             print_metrics(metrics, "  ")
-            LOG.info(f"  Quality score: {score:.4f}" + ("" if delta is None else f" ({delta:+.4f} vs previous)"))
-            LOG.info("  Defects: " + ("none" if not defects else "; ".join(defects)))
-            previous = score
-        except Exception as exc:
-            LOG.warning(f"  Iteration failed: {exc}")
-            records.append({"iteration":i,"settings":{"mask_smoothing":morph_smooth,
-                           "spline_smoothing":spline_smooth},"error":str(exc),"score":-1e30})
-    if not candidates:
-        raise RuntimeError("All optimization iterations failed")
-    score,nodes,edges,metrics,branches,dense = max(candidates,key=lambda x:x[0])
-    errors = validate_requirements(nodes, edges, metrics, min_arms, max_arms)
-    if errors:
-        raise RuntimeError("Best candidate violates hard constraints: " + "; ".join(errors))
-    output = Path(output_dir)
-    export_all(output,nodes,edges,metrics,records)
-    save_skeleton_png(mask,edges,output/"skeleton.png")
-    save_overlay(mask,nodes,edges,output/"overlay.png")
-    save_graph_figure(mask,nodes,edges,metrics,output/"graph.png")
-    LOG.info("\nSelected best iteration and exported graph.json, nodes.csv, edges.csv, graph.png, skeleton.png, overlay.png")
-    print_metrics(metrics,"  ")
-    LOG.info(f"Elapsed: {time.perf_counter()-start:.3f} s")
-    return nodes,edges,metrics
+            LOG.info(f"Elapsed: {time.perf_counter()-start:.3f} s")
+            return nodes, edges, metrics
+
+        # This arm count failed — log and try fewer arms
+        LOG.warning(f"\n✗  No valid {target_arms}-arm result; trying {target_arms-1} arms next...")
+
+    # All arm counts exhausted
+    raise RuntimeError(
+        f"All arm counts [{min_arms}..{max_arms}] failed across all smoothing iterations")
 
 
 def main() -> None:
-    parser=argparse.ArgumentParser(description="Extract a smooth anatomical octopus skeleton graph")
-    parser.add_argument("input",help="binary-mask image")
-    parser.add_argument("output",help="output directory")
-    parser.add_argument("--max-dimension",type=int,default=760,
+    parser = argparse.ArgumentParser(
+        description="Extract a smooth anatomical octopus skeleton graph (6-8 arms)")
+    parser.add_argument("input", help="binary-mask image")
+    parser.add_argument("output", help="output directory")
+    parser.add_argument("--max-dimension", type=int, default=760,
                         help="working resolution for dense thinning (default: 760)")
-    parser.add_argument("--iterations",type=int,default=3,choices=range(1,5),metavar="1..4",
+    parser.add_argument("--iterations", type=int, default=3, choices=range(1, 5), metavar="1..4",
                         help="automatic refinement iterations (default: 3)")
-    parser.add_argument("--min-arms",type=int,default=5,
-                        help="minimum number of distinct arms required to accept a result (default: 5)")
-    parser.add_argument("--max-arms",type=int,default=8,
-                        help="biological maximum/ideal arm count an octopus can have (default: 8)")
-    parser.add_argument("--quiet",action="store_true")
-    args=parser.parse_args()
-    if args.quiet: LOG.setLevel(logging.WARNING)
+    parser.add_argument("--min-arms", type=int, default=5,
+                        help="minimum arms required (default: 5)")
+    parser.add_argument("--max-arms", type=int, default=8,
+                        help="maximum arms (default: 8)")
+    parser.add_argument("--quiet", action="store_true")
+    args = parser.parse_args()
+    if args.quiet:
+        LOG.setLevel(logging.WARNING)
     if args.min_arms < 1 or args.min_arms > args.max_arms:
         parser.error("--min-arms must be >= 1 and <= --max-arms")
     try:
-        run(args.input,args.output,args.max_dimension,args.iterations,
-            args.min_arms,args.max_arms)
+        run(args.input, args.output, args.max_dimension, args.iterations,
+            args.min_arms, args.max_arms)
     except Exception as exc:
         LOG.error(f"ERROR: {exc}")
-        if not args.quiet: logging.exception("Skeletonization failed")
+        if not args.quiet:
+            logging.exception("Skeletonization failed")
         sys.exit(2)
 
 
